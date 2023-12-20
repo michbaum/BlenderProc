@@ -30,7 +30,8 @@ if sys.platform in ["linux", "linux2"]:
 
 def write_bop(output_dir: str, target_objects: Optional[List[MeshObject]] = None,
               depths: List[np.ndarray] = None, colors: List[np.ndarray] = None,
-              color_file_format: str = "PNG", dataset: str = "", append_to_existing_output: bool = True,
+              color_file_format: str = "PNG", object_dimensions: Optional[Dict[int, List[float]]] = None,
+              cameras_per_scene: Optional[int] = None, dataset: str = "", append_to_existing_output: bool = True,
               depth_scale: float = 1.0, jpg_quality: int = 95, save_world2cam: bool = True,
               ignore_dist_thres: float = 100., m2mm: Optional[bool] = None, annotation_unit: str = 'mm',
               frames_per_chunk: int = 1000, calc_mask_info_coco: bool = True, delta: float = 0.015,
@@ -43,6 +44,10 @@ def write_bop(output_dir: str, target_objects: Optional[List[MeshObject]] = None
     :param depths: List of depth images in m to save
     :param colors: List of color images to save
     :param color_file_format: File type to save color images. Available: "PNG", "JPEG"
+    :param object_dimensions: Dictionary containing the dimensions of the objects in the scene. The keys are the
+                              object ids and the values are lists containing the dimensions in [m].
+                              If None, the dimensions are not saved.
+    :param cameras_per_scene: Number of cameras per scene. If None, the number of cameras is not saved.
     :param jpg_quality: If color_file_format is "JPEG", save with the given quality.
     :param dataset: Only save annotations for objects of the specified bop dataset. Saves all object poses if undefined.
     :param append_to_existing_output: If true, the new frames will be appended to the existing ones.
@@ -66,6 +71,9 @@ def write_bop(output_dir: str, target_objects: Optional[List[MeshObject]] = None
     dataset_dir = os.path.join(output_dir, dataset)
     chunks_dir = os.path.join(dataset_dir, 'train_pbr')
     camera_path = os.path.join(dataset_dir, 'camera.json')
+    # (michbaum) New file to save additional info about the scene (e.g. object 
+    #            dimensions and number of cameras per scene)
+    additional_info_path = os.path.join(dataset_dir, 'scene_additional_info.json')
 
     # Create the output directory structure.
     if not os.path.exists(dataset_dir):
@@ -90,8 +98,9 @@ def write_bop(output_dir: str, target_objects: Optional[List[MeshObject]] = None
     else:
         dataset_objects = []
         for obj in get_all_mesh_objects():
-            if not obj.is_hidden():
-                dataset_objects.append(obj)
+            dataset_objects.append(obj)
+            # if not obj.is_hidden(): # TODO: (michbaum) Probably remove
+            #     dataset_objects.append(obj)
 
     # Check if there is any object from the specified dataset.
     if not dataset_objects:
@@ -133,6 +142,10 @@ def write_bop(output_dir: str, target_objects: Optional[List[MeshObject]] = None
                                    color_file_format=color_file_format, frames_per_chunk=frames_per_chunk,
                                    annotation_scale=annotation_scale, ignore_dist_thres=ignore_dist_thres,
                                    save_world2cam=save_world2cam, depth_scale=depth_scale, jpg_quality=jpg_quality)
+    
+    # (michbaum) Write additional info if provided
+    if object_dimensions is not None or cameras_per_scene is not None:
+        _BopWriterUtility.write_additional_info(additional_info_path, object_dimensions, cameras_per_scene)
 
     if calc_mask_info_coco:
         # Set up the bop toolkit
@@ -161,7 +174,8 @@ def write_bop(output_dir: str, target_objects: Optional[List[MeshObject]] = None
             trimesh_obj = obj.mesh_as_trimesh()
             # here we also add the scale factor of the objects. the position of the pyrender camera will change based
             # on the initial scale factor of the objects and the saved annotation format
-            if not np.all(np.isclose(np.array(obj.blender_obj.scale), obj.blender_obj.scale[0])):
+            # if not np.all(np.isclose(np.array(obj.blender_obj.scale), obj.blender_obj.scale[0])): # OLD
+            if not np.all(np.isclose(obj.get_scale(), obj.get_scale()[0])):
                 print("WARNING: the scale is not the same across all dimensions, writing bop_toolkit annotations with "
                       "the bop writer will fail!")
             trimesh_objects[obj.get_cp('category_id')] = trimesh_obj
@@ -296,6 +310,25 @@ class _BopWriterUtility:
                   'width': bpy.context.scene.render.resolution_x}
 
         _BopWriterUtility.save_json(camera_path, camera)
+
+    # (michbaum) New function to write additional info about the scene
+    @staticmethod
+    def write_additional_info(additional_info_path: str, object_dimensions: Optional[Dict[int, List[float]]],
+                              cameras_per_scene: Optional[int]):
+        """ Writes scene_additional_info.json into dataset_dir.
+        :param additional_info_path: Path to scene_additional_info.json
+        :param object_dimensions: Dictionary containing the dimensions of the objects in the scene. The keys are the
+                                  object ids and the values are lists containing the dimensions in [m].
+                                  If None, the dimensions are not saved.
+        :param cameras_per_scene: Number of cameras per scene. If None, the number of cameras is not saved.
+        """
+        additional_info = {}
+        if object_dimensions is not None:
+            additional_info["object_dimensions"] = object_dimensions
+        if cameras_per_scene is not None:
+            additional_info["cameras_per_scene"] = cameras_per_scene
+
+        _BopWriterUtility.save_json(additional_info_path, additional_info)
 
     @staticmethod
     def get_frame_gt(dataset_objects: List[bpy.types.Mesh], unit_scaling: float, ignore_dist_thres: float,
