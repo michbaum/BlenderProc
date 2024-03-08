@@ -35,7 +35,7 @@ def write_bop(output_dir: str, target_objects: Optional[List[MeshObject]] = None
               depth_scale: float = 1.0, jpg_quality: int = 95, save_world2cam: bool = True,
               ignore_dist_thres: float = 100., m2mm: Optional[bool] = None, annotation_unit: str = 'mm',
               frames_per_chunk: int = 1000, calc_mask_info_coco: bool = True, delta: float = 0.015,
-              num_worker: Optional[int] = None):
+              num_worker: Optional[int] = None, hidden_objects: Optional[dict[int, bool]] = None):
     """Write the BOP data
 
     :param output_dir: Path to the output directory.
@@ -65,6 +65,7 @@ def write_bop(output_dir: str, target_objects: Optional[List[MeshObject]] = None
     :param calc_mask_info_coco: Whether to calculate gt masks, gt info and gt coco annotations.
     :param delta: Tolerance used for estimation of the visibility masks (in [m]).
     :param num_worker: The number of processes to use to calculate gt_masks and gt_info. If None is given, number of cores is used.
+    :param hidden_objects: Dictionary containing the object ids and a boolean indicating whether the object is hidden in the scene or not.
     """
 
     # Output paths.
@@ -99,7 +100,7 @@ def write_bop(output_dir: str, target_objects: Optional[List[MeshObject]] = None
         dataset_objects = []
         for obj in get_all_mesh_objects():
             dataset_objects.append(obj)
-            # if not obj.is_hidden(): # TODO: (michbaum) Probably remove
+            # if not obj.is_hidden(): # (michbaum) -> Need be removed, otherwise the length of the info files is always different
             #     dataset_objects.append(obj)
 
     # Check if there is any object from the specified dataset.
@@ -138,6 +139,7 @@ def write_bop(output_dir: str, target_objects: Optional[List[MeshObject]] = None
     if m2mm is not None:
         warnings.warn("WARNING: `m2mm` is deprecated, please use `annotation_scale='mm'` instead!")
         annotation_scale = 1000.
+    # (michbaum) Invisible boxes are *correctly* not displayed in rgb and depth images
     _BopWriterUtility.write_frames(chunks_dir, dataset_objects=dataset_objects, depths=depths, colors=colors,
                                    color_file_format=color_file_format, frames_per_chunk=frames_per_chunk,
                                    annotation_scale=annotation_scale, ignore_dist_thres=ignore_dist_thres,
@@ -186,13 +188,16 @@ def write_bop(output_dir: str, target_objects: Optional[List[MeshObject]] = None
         pool = Pool(num_worker, initializer=_BopWriterUtility._pyrender_init, initargs=[width, height, trimesh_objects])
 
         _BopWriterUtility.calc_gt_masks(chunk_dirs=chunk_dirs, starting_frame_id=starting_frame_id,
-                                        annotation_scale=annotation_scale, delta=delta, pool=pool)
+                                        annotation_scale=annotation_scale, delta=delta, pool=pool,
+                                        hidden_objects=hidden_objects)
          
         _BopWriterUtility.calc_gt_info(chunk_dirs=chunk_dirs, starting_frame_id=starting_frame_id,
-                                       annotation_scale=annotation_scale, delta=delta, pool=pool)
+                                       annotation_scale=annotation_scale, delta=delta, pool=pool,
+                                       hidden_objects=hidden_objects)
 
-        _BopWriterUtility.calc_gt_coco(chunk_dirs=chunk_dirs, dataset_objects=dataset_objects,
-                                       starting_frame_id=starting_frame_id)
+        # TODO: (michbaum) Not needed anymore
+        #_BopWriterUtility.calc_gt_coco(chunk_dirs=chunk_dirs, dataset_objects=dataset_objects,
+        #                               starting_frame_id=starting_frame_id)
 
 
 def bop_pose_to_pyrender_coordinate_system(cam_R_m2c: np.ndarray, cam_t_m2c: np.ndarray) -> np.ndarray:
@@ -578,7 +583,8 @@ class _BopWriterUtility:
 
 
     @staticmethod
-    def _calc_gt_masks_iteration(annotation_scale: float, K: np.ndarray, delta: float, dist_im: np.ndarray, chunk_dir: str, im_id: int, gt_data: Tuple[int, Dict[str, int]]):
+    def _calc_gt_masks_iteration(annotation_scale: float, K: np.ndarray, delta: float, dist_im: np.ndarray, chunk_dir: str, 
+                                 im_id: int, gt_data: Tuple[int, Dict[str, int]], hidden_objects: Optional[dict[int,bool]] = None):
         """ One iteration of calc_gt_masks(), executed inside a worker process.
 
         
@@ -590,6 +596,7 @@ class _BopWriterUtility:
         :param chunk_dir: The chunk dir where to store the resulting images.
         :param im_id: The id of the current image/frame.
         :param gt_data: Containing id of the object whose mask the worker should render
+        :param hidden_objects: A dictionary containing the object ids and a boolean indicating whether the object is hidden in the scene or not.
         """
         # pylint: disable=import-outside-toplevel
         # Import pyrender only inside the multiprocesses, otherwise this leads to an opengl error
@@ -600,7 +607,8 @@ class _BopWriterUtility:
         # pylint: enable=import-outside-toplevel
 
         global renderer, dataset_objects
-
+        # (michbaum) gt_id is the actual object id of the object that should be rendered
+        #            Use it to find out if an object is visible or not
         gt_id, gt = gt_data
 
         # Init pyrender camera
@@ -618,16 +626,23 @@ class _BopWriterUtility:
 
         pose = bop_pose_to_pyrender_coordinate_system(cam_R_m2c=np.array(gt['cam_R_m2c']).reshape(3, 3),
                                                         cam_t_m2c=t)
-        scene.add(dataset_objects[gt['obj_id']], pose=pose)
+        # (michbaum) Check if the object is visible, otherwise do not add the object to the scene!
+        if not hidden_objects[gt_id]:
+            scene.add(dataset_objects[gt['obj_id']], pose=pose)
 
         # Render the depth image.
         _, depth_gt = renderer.render(scene=scene)
+
+        # TODO: (michbaum) Maybe we can do someting here to avoid producing masks for invisble objects
+        # The distance image that this function receives is correct for example!
 
         # Convert depth image to distance image.
         dist_gt = misc.depth_im_to_dist_im_fast(depth_gt, K)
 
         # Mask of the full object silhouette.
         mask = dist_gt > 0
+
+
 
         # Mask of the visible part of the object silhouette.
         mask_visib = visibility.estimate_visib_mask_gt(
@@ -646,7 +661,8 @@ class _BopWriterUtility:
 
     @staticmethod
     def calc_gt_masks(pool: Pool, chunk_dirs: List[str], starting_frame_id: int = 0,
-                      annotation_scale: float = 1000., delta: float = 0.015):
+                      annotation_scale: float = 1000., delta: float = 0.015,
+                      hidden_objects: Optional[dict[int,bool]] = None):
         """ Calculates the ground truth masks.
         From the BOP toolkit (https://github.com/thodan/bop_toolkit), with the difference of using pyrender for depth
         rendering.
@@ -657,6 +673,8 @@ class _BopWriterUtility:
         :param annotation_scale: The scale factor applied to the calculated annotations (in [m]) to get them into the
                                  specified format (see `annotation_format` in `write_bop` for further details).
         :param delta: Tolerance used for estimation of the visibility masks.
+        :param hidden_objects: A dictionary containing the object ids as keys and a boolean as value. If the value is
+                                 True, the object is not visible in the scene.
         """
         # This import is done inside to avoid having the requirement that BlenderProc depends on the bop_toolkit
         # pylint: disable=import-outside-toplevel
@@ -696,12 +714,15 @@ class _BopWriterUtility:
                 depth_im /= 1000.  # to [m]
                 dist_im = misc.depth_im_to_dist_im_fast(depth_im, K)
 
-                pool.map(partial(_BopWriterUtility._calc_gt_masks_iteration, annotation_scale, K, delta, dist_im, chunk_dir, im_id), enumerate(scene_gt[im_id]))
+                pool.map(partial(_BopWriterUtility._calc_gt_masks_iteration, annotation_scale, K, delta, 
+                                 dist_im, chunk_dir, im_id, hidden_objects=hidden_objects), enumerate(scene_gt[im_id]))
           
             
 
     @staticmethod
-    def _calc_gt_info_iteration(annotation_scale: float, ren_cy_offset: int, ren_cx_offset: int, im_height: int, im_width: int, K: np.ndarray, delta: float, depth: np.ndarray, gt: Dict[str, int]):
+    def _calc_gt_info_iteration(annotation_scale: float, ren_cy_offset: int, ren_cx_offset: int, im_height: int, 
+                                im_width: int, K: np.ndarray, delta: float, depth: np.ndarray, 
+                                gt_data: Tuple[int, Dict[str, int]], hidden_objects: Optional[dict[int,bool]] = None):
         """ One iteration of calc_gt_info(), executed inside a worker process.
         
         :param annotation_scale: The scale factor applied to the calculated annotations (in [m]) to get them into the
@@ -713,7 +734,8 @@ class _BopWriterUtility:
         :param K: The camera instrinsics to use.
         :param delta: Tolerance used for estimation of the visibility masks.
         :param depth: The depth image of the frame.
-        :param gt: Containing id of the object whose mask the worker should render
+        :param gt_data: Containing id of the object whose mask the worker should render
+        :param hidden_objects: A dictionary containing the object ids and a boolean indicating whether the object is hidden in the scene or not.
         """         
         # Import pyrender only inside the multiprocesses, otherwise this leads to an opengl error
         # https://github.com/mmatl/pyrender/issues/200#issuecomment-1123713055   
@@ -723,6 +745,9 @@ class _BopWriterUtility:
         # pylint: enable=import-outside-toplevel
 
         global renderer_large, dataset_objects, renderer
+
+        # (michbaum) gt_id is the actual object id of the object that should be rendered
+        gt_id, gt = gt_data
 
         # Delete renderer of the previous calc_gt_masks() function, otherwise
         # we cannot make use of the same pyrender Meshes
@@ -746,7 +771,10 @@ class _BopWriterUtility:
         t /= annotation_scale
         pose = bop_pose_to_pyrender_coordinate_system(cam_R_m2c=np.array(gt['cam_R_m2c']).reshape(3, 3),
                                                         cam_t_m2c=t)
-        scene.add(dataset_objects[gt['obj_id']], pose=pose)
+
+        # (michbaum) Check if the object is visible, otherwise do not add the object to the scene!
+        if not hidden_objects[gt_id]:
+            scene.add(dataset_objects[gt['obj_id']], pose=pose)
 
         # render the depth image
         _, depth_gt_large = renderer_large.render(scene=scene)
@@ -811,7 +839,8 @@ class _BopWriterUtility:
 
     @staticmethod
     def calc_gt_info(pool, chunk_dirs: List[str], starting_frame_id: int = 0,
-                     annotation_scale: float = 1000., delta: float = 0.015):
+                     annotation_scale: float = 1000., delta: float = 0.015,
+                     hidden_objects: Optional[dict[int,bool]] = None):
         """ Calculates the ground truth masks.
         From the BOP toolkit (https://github.com/thodan/bop_toolkit), with the difference of using pyrender for depth
         rendering.
@@ -821,6 +850,8 @@ class _BopWriterUtility:
         :param annotation_scale: The scale factor applied to the calculated annotations (in [m]) to get them into the
                                  specified format (see `annotation_format` in `write_bop` for further details).
         :param delta: Tolerance used for estimation of the visibility masks.
+        :param hidden_objects: A dictionary containing the object ids as keys and a boolean as value. If the value is
+                                 True, the object is not visible in the scene.
         """
         # This import is done inside to avoid having the requirement that BlenderProc depends on the bop_toolkit
         # pylint: disable=import-outside-toplevel
@@ -863,7 +894,11 @@ class _BopWriterUtility:
 
                 K = np.array(scene_camera[im_id]['cam_K']).reshape(3, 3)
 
-                scene_gt_info[im_id] = pool.map(partial(_BopWriterUtility._calc_gt_info_iteration, annotation_scale, ren_cy_offset, ren_cx_offset, im_height, im_width, K, delta, depth), scene_gt[im_id])
+                scene_gt_info[im_id] = pool.map(partial(_BopWriterUtility._calc_gt_info_iteration, 
+                                                        annotation_scale, ren_cy_offset, ren_cx_offset, 
+                                                        im_height, im_width, K, delta, depth, 
+                                                        hidden_objects=hidden_objects), 
+                                                        enumerate(scene_gt[im_id]))
                     
 
             # Save the info for the current scene.
