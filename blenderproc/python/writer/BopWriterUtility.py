@@ -31,6 +31,7 @@ if sys.platform in ["linux", "linux2"]:
 def write_bop(output_dir: str, target_objects: Optional[List[MeshObject]] = None,
               depths: List[np.ndarray] = None, colors: List[np.ndarray] = None,
               color_file_format: str = "PNG", object_dimensions: Optional[Dict[int, List[float]]] = None,
+              object_categories: Optional[Dict[int, str]] = None,
               cameras_per_scene: Optional[int] = None, dataset: str = "", append_to_existing_output: bool = True,
               depth_scale: float = 1.0, jpg_quality: int = 95, save_world2cam: bool = True,
               ignore_dist_thres: float = 100., m2mm: Optional[bool] = None, annotation_unit: str = 'mm',
@@ -47,6 +48,8 @@ def write_bop(output_dir: str, target_objects: Optional[List[MeshObject]] = None
     :param object_dimensions: Dictionary containing the dimensions of the objects in the scene. The keys are the
                               object ids and the values are lists containing the dimensions in [m].
                               If None, the dimensions are not saved.
+    :param object_categories: Dictionary containing the categories of the objects in the scene. The keys are the
+                              object instance ids and the values are the category names.
     :param cameras_per_scene: Number of cameras per scene. If None, the number of cameras is not saved.
     :param jpg_quality: If color_file_format is "JPEG", save with the given quality.
     :param dataset: Only save annotations for objects of the specified bop dataset. Saves all object poses if undefined.
@@ -146,8 +149,9 @@ def write_bop(output_dir: str, target_objects: Optional[List[MeshObject]] = None
                                    save_world2cam=save_world2cam, depth_scale=depth_scale, jpg_quality=jpg_quality)
     
     # (michbaum) Write additional info if provided
-    if object_dimensions is not None or cameras_per_scene is not None:
-        _BopWriterUtility.write_additional_info(additional_info_path, object_dimensions, cameras_per_scene)
+    if object_dimensions is not None or cameras_per_scene is not None or object_categories is not None:
+        _BopWriterUtility.write_additional_info(additional_info_path, object_dimensions, 
+                                                cameras_per_scene, object_categories)
 
     if calc_mask_info_coco:
         # Set up the bop toolkit
@@ -319,19 +323,23 @@ class _BopWriterUtility:
     # (michbaum) New function to write additional info about the scene
     @staticmethod
     def write_additional_info(additional_info_path: str, object_dimensions: Optional[Dict[int, List[float]]],
-                              cameras_per_scene: Optional[int]):
+                              cameras_per_scene: Optional[int], object_categories: Optional[Dict[int, str]]):
         """ Writes scene_additional_info.json into dataset_dir.
         :param additional_info_path: Path to scene_additional_info.json
         :param object_dimensions: Dictionary containing the dimensions of the objects in the scene. The keys are the
                                   object ids and the values are lists containing the dimensions in [m].
                                   If None, the dimensions are not saved.
         :param cameras_per_scene: Number of cameras per scene. If None, the number of cameras is not saved.
+        :param object_categories: Dictionary containing the categories of the objects in the scene. The keys are the
+                                  object instance ids and the values are the category names.
         """
         additional_info = {}
         if object_dimensions is not None:
             additional_info["object_dimensions"] = object_dimensions
         if cameras_per_scene is not None:
             additional_info["cameras_per_scene"] = cameras_per_scene
+        if object_categories is not None:
+            additional_info["object_categories"] = object_categories
 
         _BopWriterUtility.save_json(additional_info_path, additional_info)
 
